@@ -198,15 +198,68 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
-    if msg.voice:
-        file = await msg.voice.get_file()
-    elif msg.audio:
-        file = await msg.audio.get_file()
-    elif msg.video_note:
-        file = await msg.video_note.get_file()
-    elif msg.video:
-        file = await msg.video.get_file()
+    
+    # Check if this is a group chat
+    is_group = msg.chat.type in ["group", "supergroup"]
+    
+    # In groups, only process if bot is mentioned
+    if is_group:
+        bot_username = context.bot.username
+        if not bot_username:
+            log.warning("Bot username not available in context, fetching...")
+            bot_me = await context.bot.get_me()
+            bot_username = bot_me.username
+        
+        bot_mention = f"@{bot_username}".lower()
+        mentioned = False
+        
+        # If it's a command (starts with /), consider it mentioned
+        if msg.text and msg.text.startswith("/"):
+            mentioned = True
+            
+        # Check if bot is mentioned in caption or text (case-insensitive)
+        if not mentioned and msg.caption and bot_mention in msg.caption.lower():
+            mentioned = True
+        elif not mentioned and msg.text and bot_mention in msg.text.lower():
+            mentioned = True
+        
+        # Check mentions in entities
+        if not mentioned and msg.entities:
+            for entity in msg.entities:
+                if entity.type == "mention":
+                    mention_text = msg.text[entity.offset:entity.offset + entity.length].lower()
+                    if mention_text == bot_mention:
+                        mentioned = True
+                        break
+        
+        if not mentioned:
+            # Check if it's a reply TO the bot itself – always process those
+            if msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id:
+                mentioned = True
+            else:
+                log.info("Ignored message in %s: no mention of %s found", msg.chat.type, bot_mention)
+                return
+    
+    # Check if we need to get voice from reply (when someone replies to voice with bot mention)
+    target_msg = msg
+    if msg.reply_to_message and (msg.reply_to_message.voice or msg.reply_to_message.audio or 
+                                  msg.reply_to_message.video_note or msg.reply_to_message.video):
+        target_msg = msg.reply_to_message
+    
+    if target_msg.voice:
+        file = await target_msg.voice.get_file()
+    elif target_msg.audio:
+        file = await target_msg.audio.get_file()
+    elif target_msg.video_note:
+        file = await target_msg.video_note.get_file()
+    elif target_msg.video:
+        file = await target_msg.video.get_file()
     else:
+        if is_group:
+            await msg.reply_text(
+                "I was mentioned, but I can't see the voice message. 🧐\n\n"
+                "To fix this, please **make me an Administrator** or disable **Privacy Mode** in @BotFather."
+            )
         return
 
     log.info("Voice from %s (%d)", user.first_name, user.id)
@@ -293,9 +346,10 @@ def main():
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler(["t", "transcribe"], handle_voice))
     app.add_handler(
         MessageHandler(
-            filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.VIDEO,
+            filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.VIDEO | filters.TEXT & (~filters.COMMAND),
             handle_voice,
         )
     )
