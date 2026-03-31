@@ -7,11 +7,14 @@ either a local Whisper model or the Gemini API.
 All configuration is done via environment variables — see .env.example
 """
 
+import gc
 import logging
 import os
 import sys
 import tempfile
 import time
+import asyncio
+from typing import Optional
 
 from telegram import Update, ReplyParameters
 from telegram.ext import (
@@ -37,29 +40,63 @@ class WhisperEngine:
     """Offline speech-to-text engine powered by faster-whisper."""
 
     def __init__(self):
-        from faster_whisper import WhisperModel
-
         self.model_path = os.getenv("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
         self.model2_path = os.getenv("WHISPER_MODEL2")
         self.special_lang = os.getenv("WHISPER_SPECIAL_LANG", "he")
-        
+
         self.device = os.getenv("WHISPER_DEVICE", "cpu")
         self.compute = os.getenv("WHISPER_COMPUTE", "int8")
-        
-        log.info("Loading Whisper model: %s (%s/%s)", self.model_path, self.device, self.compute)
-        t0 = time.time()
-        self.model = WhisperModel(self.model_path, device=self.device, compute_type=self.compute)
-        self.model2 = None  # Lazy load
-        
+
+        self.device2 = os.getenv("WHISPER_DEVICE2", self.device)
+        self.compute2 = os.getenv("WHISPER_COMPUTE2", self.compute)
+
+        self.model = None
+        self.model2 = None
+        self.last_active = 0.0
+        self.idle_timeout = int(os.getenv("WHISPER_IDLE_TIMEOUT", "600"))
+
         lang = os.getenv("WHISPER_LANGUAGE", "auto")
         self.language = None if lang == "auto" else lang
         self.beam = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-        log.info("Whisper loaded in %.1fs", time.time() - t0)
+        log.info("Whisper engine initialized (idle timeout: %ds)", self.idle_timeout)
+
+    def _ensure_model_loaded(self, special=False):
+        """Lazy load models when needed."""
+        from faster_whisper import WhisperModel
+        self.last_active = time.time()
+
+        if special:
+            if not self.model2:
+                log.info("Loading special Whisper model: %s on %s (%s)", self.model2_path, self.device2, self.compute2)
+                t0 = time.time()
+                self.model2 = WhisperModel(self.model2_path, device=self.device2, compute_type=self.compute2)
+                log.info("Special model loaded in %.1fs", time.time() - t0)
+            return self.model2
+        else:
+            if not self.model:
+                log.info("Loading default Whisper model: %s", self.model_path)
+                t0 = time.time()
+                self.model = WhisperModel(self.model_path, device=self.device, compute_type=self.compute)
+                log.info("Default model loaded in %.1fs", time.time() - t0)
+            return self.model
+
+    def unload_if_idle(self) -> bool:
+        """Unload models from memory if they have been idle too long."""
+        if (self.model or self.model2) and (time.time() - self.last_active > self.idle_timeout):
+            log.info("Inactivity timeout reached (%ds), unloading Whisper models...", self.idle_timeout)
+            self.model = None
+            self.model2 = None
+            gc.collect()
+            log.info("Models unloaded. Current RAM usage may drop.")
+            return True
+        return False
 
     def transcribe(self, path: str) -> dict:
         """Transcribe an audio file and return text with metadata."""
         t0 = time.time()
-        segs, info = self.model.transcribe(
+        model = self._ensure_model_loaded()
+
+        segs, info = model.transcribe(
             path,
             language=self.language,
             beam_size=self.beam,
@@ -72,14 +109,9 @@ class WhisperEngine:
 
         # Check if we should switch to the special model
         if self.model2_path and detected_lang == self.special_lang:
-            log.info("Switching to special model %s for language: %s", self.model2_path, detected_lang)
-            if not self.model2:
-                from faster_whisper import WhisperModel
-                t_load = time.time()
-                self.model2 = WhisperModel(self.model2_path, device=self.device, compute_type=self.compute)
-                log.info("Special model loaded in %.1fs", time.time() - t_load)
-            
-            segs, info = self.model2.transcribe(
+            log.info("Switching to special model for language: %s", detected_lang)
+            model2 = self._ensure_model_loaded(special=True)
+            segs, info = model2.transcribe(
                 path,
                 language=detected_lang,
                 beam_size=self.beam,
@@ -89,6 +121,7 @@ class WhisperEngine:
             engine_name = f"whisper-special ({detected_lang})"
 
         texts = [s.text.strip() for s in segs]
+        self.last_active = time.time()
         return {
             "text": " ".join(texts),
             "duration": info.duration,
@@ -221,6 +254,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def idle_checker_task():
+    """Background task that runs forever and checks for idle engine."""
+    while True:
+        await asyncio.sleep(60)
+        if stt_engine and hasattr(stt_engine, "unload_if_idle"):
+            stt_engine.unload_if_idle()
+
+
+async def post_init(app: Application):
+    """Run after the application is initialized."""
+    log.info("Starting background idle checker task...")
+    asyncio.create_task(idle_checker_task())
+
+
 def main():
     """Initialize the STT engine and start the Telegram bot."""
     global stt_engine, allowed_users
@@ -244,7 +291,7 @@ def main():
     else:
         stt_engine = WhisperEngine()
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(
         MessageHandler(
