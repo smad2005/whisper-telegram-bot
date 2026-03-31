@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from telegram import Update
+from telegram import Update, ReplyParameters
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -39,12 +39,18 @@ class WhisperEngine:
     def __init__(self):
         from faster_whisper import WhisperModel
 
-        model = os.getenv("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
-        device = os.getenv("WHISPER_DEVICE", "cpu")
-        compute = os.getenv("WHISPER_COMPUTE", "int8")
-        log.info("Loading Whisper model: %s (%s/%s)", model, device, compute)
+        self.model_path = os.getenv("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
+        self.model2_path = os.getenv("WHISPER_MODEL2")
+        self.special_lang = os.getenv("WHISPER_SPECIAL_LANG", "he")
+        
+        self.device = os.getenv("WHISPER_DEVICE", "cpu")
+        self.compute = os.getenv("WHISPER_COMPUTE", "int8")
+        
+        log.info("Loading Whisper model: %s (%s/%s)", self.model_path, self.device, self.compute)
         t0 = time.time()
-        self.model = WhisperModel(model, device=device, compute_type=compute)
+        self.model = WhisperModel(self.model_path, device=self.device, compute_type=self.compute)
+        self.model2 = None  # Lazy load
+        
         lang = os.getenv("WHISPER_LANGUAGE", "auto")
         self.language = None if lang == "auto" else lang
         self.beam = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
@@ -60,12 +66,34 @@ class WhisperEngine:
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
         )
+
+        detected_lang = info.language
+        engine_name = "whisper"
+
+        # Check if we should switch to the special model
+        if self.model2_path and detected_lang == self.special_lang:
+            log.info("Switching to special model %s for language: %s", self.model2_path, detected_lang)
+            if not self.model2:
+                from faster_whisper import WhisperModel
+                t_load = time.time()
+                self.model2 = WhisperModel(self.model2_path, device=self.device, compute_type=self.compute)
+                log.info("Special model loaded in %.1fs", time.time() - t_load)
+            
+            segs, info = self.model2.transcribe(
+                path,
+                language=detected_lang,
+                beam_size=self.beam,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
+            )
+            engine_name = f"whisper-special ({detected_lang})"
+
         texts = [s.text.strip() for s in segs]
         return {
             "text": " ".join(texts),
             "duration": info.duration,
             "elapsed": time.time() - t0,
-            "engine": "whisper",
+            "engine": engine_name,
         }
 
 
@@ -81,7 +109,8 @@ class GeminiEngine:
             sys.exit(1)
         self.client = genai.Client(api_key=key)
         self.model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        self.language = os.getenv("GEMINI_LANGUAGE", "English")
+        lang = os.getenv("GEMINI_LANGUAGE", "auto")
+        self.language = "Detect language" if lang == "auto" else lang
         log.info("Gemini ready: %s (%s)", self.model, self.language)
 
     def transcribe(self, path: str) -> dict:
@@ -148,7 +177,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.info("Voice from %s (%d)", user.first_name, user.id)
-    status = await msg.reply_text("Transcribing...")
+    status = await msg.reply_text(
+        "Transcribing...",
+        reply_parameters=ReplyParameters(message_id=msg.message_id),
+    )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
     tmp.close()
@@ -170,7 +202,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(reply) > 4096:
             await status.edit_text(reply[:4096])
             for i in range(4096, len(reply), 4096):
-                await msg.reply_text(reply[i : i + 4096])
+                await msg.reply_text(
+                    reply[i : i + 4096],
+                    reply_parameters=ReplyParameters(message_id=msg.message_id),
+                )
         else:
             await status.edit_text(reply)
 
@@ -195,9 +230,13 @@ def main():
         log.error("BOT_TOKEN is not set! Check your .env file.")
         sys.exit(1)
 
-    au = os.getenv("ALLOWED_USERS", "")
+    au = os.getenv("ALLOWED_USERS", "").split("#")[0].strip()
     if au:
-        allowed_users = [int(x.strip()) for x in au.split(",") if x.strip()]
+        try:
+            allowed_users = [int(x.strip()) for x in au.split(",") if x.strip()]
+        except ValueError as e:
+            log.error("Invalid user ID in ALLOWED_USERS: %s", e)
+            sys.exit(1)
 
     engine = os.getenv("STT_ENGINE", "whisper")
     if engine == "gemini":
@@ -215,7 +254,7 @@ def main():
     )
 
     log.info("Bot started (%s)", engine)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":

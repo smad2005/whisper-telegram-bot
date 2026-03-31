@@ -1,5 +1,6 @@
 # Environment
 .env
+models
 
 # Python
 __pycache__/

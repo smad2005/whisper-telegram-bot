@@ -2,11 +2,15 @@ services:
   bot:
     build: .
     container_name: whisper-telegram-bot
-    restart: unless-stopped
     env_file: .env
     volumes:
       # Persist downloaded Whisper models between restarts
-      - model-cache:/root/.cache/huggingface
+      - ./models:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
-volumes:
-  model-cache:
