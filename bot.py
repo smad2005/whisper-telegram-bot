@@ -7,23 +7,18 @@ either a local Whisper model or the Gemini API.
 All configuration is done via environment variables — see .env.example
 """
 
-import gc
 import logging
-import os
 import sys
-import tempfile
-import time
-import asyncio
-from typing import Optional
 
-from telegram import Update, ReplyParameters
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
+from config import load_config
+from engines.gemini_engine import GeminiEngine
+from engines.whisper_engine import WhisperEngine
+from handlers.commands import cmd_start
+from handlers.transcription import handle_voice
+from services.idle_checker import post_init
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,330 +27,56 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-stt_engine = None
-allowed_users = []
 
-
-class WhisperEngine:
-    """Offline speech-to-text engine powered by faster-whisper."""
-
-    def __init__(self):
-        self.model_path = os.getenv("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
-        self.model2_path = os.getenv("WHISPER_MODEL2")
-        self.special_lang = os.getenv("WHISPER_SPECIAL_LANG", "he")
-
-        self.device = os.getenv("WHISPER_DEVICE", "cpu")
-        self.compute = os.getenv("WHISPER_COMPUTE", "int8")
-
-        self.device2 = os.getenv("WHISPER_DEVICE2", self.device)
-        self.compute2 = os.getenv("WHISPER_COMPUTE2", self.compute)
-
-        self.model = None
-        self.model2 = None
-        self.last_active = 0.0
-        self.idle_timeout = int(os.getenv("WHISPER_IDLE_TIMEOUT", "600"))
-
-        lang = os.getenv("WHISPER_LANGUAGE", "auto")
-        self.language = None if lang == "auto" else lang
-        self.beam = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-        log.info("Whisper engine initialized (idle timeout: %ds)", self.idle_timeout)
-
-    def _ensure_model_loaded(self, special=False):
-        """Lazy load models when needed."""
-        from faster_whisper import WhisperModel
-        self.last_active = time.time()
-
-        if special:
-            if not self.model2:
-                log.info("Loading special Whisper model: %s on %s (%s)", self.model2_path, self.device2, self.compute2)
-                t0 = time.time()
-                self.model2 = WhisperModel(self.model2_path, device=self.device2, compute_type=self.compute2)
-                log.info("Special model loaded in %.1fs", time.time() - t0)
-            return self.model2
-        else:
-            if not self.model:
-                log.info("Loading default Whisper model: %s", self.model_path)
-                t0 = time.time()
-                self.model = WhisperModel(self.model_path, device=self.device, compute_type=self.compute)
-                log.info("Default model loaded in %.1fs", time.time() - t0)
-            return self.model
-
-    def unload_if_idle(self) -> bool:
-        """Unload models from memory if they have been idle too long."""
-        if (self.model or self.model2) and (time.time() - self.last_active > self.idle_timeout):
-            log.info("Inactivity timeout reached (%ds), unloading Whisper models...", self.idle_timeout)
-            self.model = None
-            self.model2 = None
-            gc.collect()
-            log.info("Models unloaded. Current RAM usage may drop.")
-            return True
-        return False
-
-    def transcribe(self, path: str) -> dict:
-        """Transcribe an audio file and return text with metadata."""
-        t0 = time.time()
-        model = self._ensure_model_loaded()
-
-        segs, info = model.transcribe(
-            path,
-            language=self.language,
-            beam_size=self.beam,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
-        )
-
-        detected_lang = info.language
-        engine_name = "whisper"
-
-        # Check if we should switch to the special model
-        if self.model2_path and detected_lang == self.special_lang:
-            log.info("Switching to special model for language: %s", detected_lang)
-            model2 = self._ensure_model_loaded(special=True)
-            segs, info = model2.transcribe(
-                path,
-                language=detected_lang,
-                beam_size=self.beam,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
-            )
-            engine_name = f"whisper-special ({detected_lang})"
-
-        texts = [s.text.strip() for s in segs]
-        self.last_active = time.time()
-        return {
-            "text": " ".join(texts),
-            "duration": info.duration,
-            "elapsed": time.time() - t0,
-            "engine": engine_name,
-        }
-
-
-class GeminiEngine:
-    """Cloud-based speech-to-text engine powered by Google Gemini API."""
-
-    def __init__(self):
-        from google import genai
-
-        key = os.getenv("GEMINI_API_KEY", "")
-        if not key or key == "YOUR_GEMINI_API_KEY":
-            log.error("GEMINI_API_KEY is not set! Check your .env file.")
-            sys.exit(1)
-        self.client = genai.Client(api_key=key)
-        self.model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        lang = os.getenv("GEMINI_LANGUAGE", "auto")
-        self.language = "Detect language" if lang == "auto" else lang
-        log.info("Gemini ready: %s (%s)", self.model, self.language)
-
-    def transcribe(self, path: str) -> dict:
-        """Send audio to Gemini API and return transcription with metadata."""
-        from google.genai import types
-
-        t0 = time.time()
-        with open(path, "rb") as f:
-            data = f.read()
-        ext = os.path.splitext(path)[1].lower()
-        mimes = {
-            ".ogg": "audio/ogg",
-            ".wav": "audio/wav",
-            ".mp3": "audio/mpeg",
-            ".m4a": "audio/mp4",
-            ".aac": "audio/aac",
-            ".flac": "audio/flac",
-            ".webm": "audio/webm",
-        }
-        resp = self.client.models.generate_content(
-            model=self.model,
-            contents=[
-                f"Transcribe this audio. Language: {self.language}. "
-                f"Output ONLY the transcription, nothing else.",
-                types.Part.from_bytes(
-                    data=data, mime_type=mimes.get(ext, "audio/ogg")
-                ),
-            ],
-        )
-        return {
-            "text": resp.text.strip(),
-            "duration": 0,
-            "elapsed": time.time() - t0,
-            "engine": "gemini",
-        }
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command — greet the user."""
-    engine = os.getenv("STT_ENGINE", "whisper")
-    await update.message.reply_text(
-        f"Send me a voice message and I will transcribe it.\n"
-        f"Engine: {engine}"
-    )
-
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming voice messages, audio files, and video notes."""
-    user = update.effective_user
-    if allowed_users and user.id not in allowed_users:
-        await update.message.reply_text("Access denied.")
-        return
-
-    msg = update.message
-    
-    # Check if this is a group chat
-    is_group = msg.chat.type in ["group", "supergroup"]
-    
-    # In groups, only process if bot is mentioned
-    if is_group:
-        bot_username = context.bot.username
-        if not bot_username:
-            log.warning("Bot username not available in context, fetching...")
-            bot_me = await context.bot.get_me()
-            bot_username = bot_me.username
-        
-        bot_mention = f"@{bot_username}".lower()
-        mentioned = False
-        
-        # If it's a command (starts with /), consider it mentioned
-        if msg.text and msg.text.startswith("/"):
-            mentioned = True
-            
-        # Check if bot is mentioned in caption or text (case-insensitive)
-        if not mentioned and msg.caption and bot_mention in msg.caption.lower():
-            mentioned = True
-        elif not mentioned and msg.text and bot_mention in msg.text.lower():
-            mentioned = True
-        
-        # Check mentions in entities
-        if not mentioned and msg.entities:
-            for entity in msg.entities:
-                if entity.type == "mention":
-                    mention_text = msg.text[entity.offset:entity.offset + entity.length].lower()
-                    if mention_text == bot_mention:
-                        mentioned = True
-                        break
-        
-        if not mentioned:
-            # Check if it's a reply TO the bot itself – always process those
-            if msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id:
-                mentioned = True
-            else:
-                log.info("Ignored message in %s: no mention of %s found", msg.chat.type, bot_mention)
-                return
-    
-    # Check if we need to get voice from reply (when someone replies to voice with bot mention)
-    target_msg = msg
-    if msg.reply_to_message and (msg.reply_to_message.voice or msg.reply_to_message.audio or 
-                                  msg.reply_to_message.video_note or msg.reply_to_message.video):
-        target_msg = msg.reply_to_message
-    
-    if target_msg.voice:
-        file = await target_msg.voice.get_file()
-    elif target_msg.audio:
-        file = await target_msg.audio.get_file()
-    elif target_msg.video_note:
-        file = await target_msg.video_note.get_file()
-    elif target_msg.video:
-        file = await target_msg.video.get_file()
-    else:
-        if is_group:
-            await msg.reply_text(
-                "I was mentioned, but I can't see the voice message. 🧐\n\n"
-                "To fix this, please **make me an Administrator** or disable **Privacy Mode** in @BotFather."
-            )
-        return
-
-    log.info("Voice from %s (%d)", user.first_name, user.id)
-    status = await msg.reply_text(
-        "Transcribing...",
-        reply_parameters=ReplyParameters(message_id=msg.message_id),
-    )
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
-    tmp.close()
-
-    try:
-        await file.download_to_drive(tmp.name)
-        r = stt_engine.transcribe(tmp.name)
-        text = r["text"]
-
-        if not text.strip():
-            await status.edit_text("(no speech detected)")
-            return
-
-        footer = f"Engine: {r['engine']} | {r['elapsed']:.1f}s"
-        if r["duration"]:
-            footer = f"Audio: {r['duration']:.1f}s | " + footer
-
-        reply = f"{text}\n\n---\n{footer}"
-        if len(reply) > 4096:
-            await status.edit_text(reply[:4096])
-            for i in range(4096, len(reply), 4096):
-                await msg.reply_text(
-                    reply[i : i + 4096],
-                    reply_parameters=ReplyParameters(message_id=msg.message_id),
-                )
-        else:
-            await status.edit_text(reply)
-
-        log.info("Done: %s %.1fs: %s", r["engine"], r["elapsed"], text[:100])
-
-    except Exception as e:
-        log.error("Transcription error: %s", e, exc_info=True)
-        await status.edit_text(f"Error: {e}")
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-
-
-async def idle_checker_task():
-    """Background task that runs forever and checks for idle engine."""
-    while True:
-        await asyncio.sleep(60)
-        if stt_engine and hasattr(stt_engine, "unload_if_idle"):
-            stt_engine.unload_if_idle()
-
-
-async def post_init(app: Application):
-    """Run after the application is initialized."""
-    log.info("Starting background idle checker task...")
-    asyncio.create_task(idle_checker_task())
+def build_engine(config):
+    """Create the configured speech-to-text engine."""
+    if config.engine == "gemini":
+        return GeminiEngine(config.gemini)
+    return WhisperEngine(config.whisper)
 
 
 def main():
     """Initialize the STT engine and start the Telegram bot."""
-    global stt_engine, allowed_users
-
-    token = os.getenv("BOT_TOKEN", "")
-    if not token or token == "YOUR_BOT_TOKEN":
-        log.error("BOT_TOKEN is not set! Check your .env file.")
+    try:
+        config = load_config()
+    except ValueError as exc:
+        log.error(str(exc))
         sys.exit(1)
 
-    au = os.getenv("ALLOWED_USERS", "").split("#")[0].strip()
-    if au:
-        try:
-            allowed_users = [int(x.strip()) for x in au.split(",") if x.strip()]
-        except ValueError as e:
-            log.error("Invalid user ID in ALLOWED_USERS: %s", e)
-            sys.exit(1)
+    app = (
+        Application.builder()
+        .token(config.telegram.token)
+        .post_init(post_init)
+        .read_timeout(config.telegram.polling_timeout)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
 
-    engine = os.getenv("STT_ENGINE", "whisper")
-    if engine == "gemini":
-        stt_engine = GeminiEngine()
-    else:
-        stt_engine = WhisperEngine()
+    app.bot_data["config"] = config
+    app.bot_data["allowed_users"] = config.telegram.allowed_users
+    app.bot_data["stt_engine"] = build_engine(config)
 
-    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["t", "transcribe"], handle_voice))
     app.add_handler(
         MessageHandler(
-            filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.VIDEO | filters.TEXT & (~filters.COMMAND),
+            filters.VOICE
+            | filters.AUDIO
+            | filters.VIDEO_NOTE
+            | filters.VIDEO
+            | (filters.TEXT & (~filters.COMMAND)),
             handle_voice,
         )
     )
 
-    log.info("Bot started (%s)", engine)
-    app.run_polling(drop_pending_updates=False)
+    log.info("Bot started (%s) with long polling (%ss timeout)", config.engine, config.telegram.polling_timeout)
+    app.run_polling(
+        drop_pending_updates=False,
+        poll_interval=0.0,
+        timeout=config.telegram.polling_timeout,
+    )
 
 
 if __name__ == "__main__":

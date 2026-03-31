@@ -3,6 +3,8 @@ services:
     build: .
     container_name: whisper-telegram-bot
     env_file: .env
+    environment:
+      - ORT_LOGGING_LEVEL=3  # Suppress ONNX Runtime warnings (0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal)
     volumes:
       # Persist downloaded Whisper models between restarts
       - ./models:/root/.cache/huggingface
