@@ -7,6 +7,7 @@ import tempfile
 import time
 
 from telegram import ReplyParameters, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from services.progress import ProgressState, build_status_message
@@ -14,6 +15,8 @@ from services.subtitles import build_srt
 
 
 log = logging.getLogger("bot")
+
+BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {
     ".ogg",
@@ -112,6 +115,39 @@ def _get_target_file_name(target_msg) -> str:
     if target_msg.document and _is_supported_document(target_msg.document):
         return target_msg.document.file_name or "document.bin"
     return "media.bin"
+
+
+def _get_target_media_size(target_msg) -> int | None:
+    """Return Telegram-reported file size for the selected media, if available."""
+    for media in (
+        getattr(target_msg, "voice", None),
+        getattr(target_msg, "audio", None),
+        getattr(target_msg, "video_note", None),
+        getattr(target_msg, "video", None),
+        getattr(target_msg, "document", None),
+    ):
+        if media and getattr(media, "file_size", None):
+            return int(media.file_size)
+    return None
+
+
+def _format_size_mb(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _build_file_too_big_message(size_bytes: int | None = None) -> str:
+    """Build a user-facing explanation for Telegram Bot API download limits."""
+    size_line = f"Your file size: {_format_size_mb(size_bytes)}\n" if size_bytes else ""
+    return (
+        "This file is too big for Telegram Bot API download.\n\n"
+        f"{size_line}"
+        f"Current Bot API getFile limit: {_format_size_mb(BOT_API_DOWNLOAD_LIMIT_BYTES)}\n\n"
+        "Try one of these options:\n"
+        "• send a smaller/compressed video\n"
+        "• trim the video before sending\n"
+        "• send audio extracted from the video\n"
+        "• run a local telegram-bot-api server if you need bigger downloads"
+    )
 
 
 def _build_srt_name(target_msg) -> str:
@@ -273,7 +309,25 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     target_msg = _resolve_target_message(msg)
-    tg_file = await _get_media_file(target_msg)
+    target_size = _get_target_media_size(target_msg)
+    if target_size and target_size > BOT_API_DOWNLOAD_LIMIT_BYTES:
+        await msg.reply_text(
+            _build_file_too_big_message(target_size),
+            reply_parameters=ReplyParameters(message_id=msg.message_id),
+        )
+        return
+
+    try:
+        tg_file = await _get_media_file(target_msg)
+    except BadRequest as exc:
+        if "File is too big" in str(exc):
+            await msg.reply_text(
+                _build_file_too_big_message(target_size),
+                reply_parameters=ReplyParameters(message_id=msg.message_id),
+            )
+            return
+        raise
+
     if not tg_file:
         if msg.chat.type in ["group", "supergroup"]:
             await msg.reply_text(
