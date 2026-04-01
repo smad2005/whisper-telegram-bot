@@ -36,6 +36,7 @@ def draw_indeterminate_bar(step: int, length: int = 10) -> str:
 def format_stage(stage: str) -> str:
     labels = {
         "idle": "Waiting",
+        "extracting-audio": "Converting video to audio",
         "loading-default": "Loading default model",
         "detecting-language": "Detecting language",
         "language-detected": "Preparing transcription",

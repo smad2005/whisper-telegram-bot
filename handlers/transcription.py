@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import mimetypes
 import os
+import subprocess
 import tempfile
 import time
 
@@ -8,9 +10,149 @@ from telegram import ReplyParameters, Update
 from telegram.ext import ContextTypes
 
 from services.progress import ProgressState, build_status_message
+from services.subtitles import build_srt
 
 
 log = logging.getLogger("bot")
+
+SUPPORTED_DOCUMENT_EXTENSIONS = {
+    ".ogg",
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".webm",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".m4v",
+}
+
+SUPPORTED_VIDEO_DOCUMENT_EXTENSIONS = {
+    ".webm",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".m4v",
+}
+
+
+def _guess_suffix(file_name: str | None, mime_type: str | None, default: str = ".bin") -> str:
+    """Pick a useful local file suffix for Telegram media downloads."""
+    if file_name:
+        _, ext = os.path.splitext(file_name)
+        if ext:
+            return ext.lower()
+
+    if mime_type:
+        guessed = mimetypes.guess_extension(mime_type, strict=False)
+        if guessed:
+            return guessed.lower()
+
+    return default
+
+
+def _is_supported_document(document) -> bool:
+    """Return True for audio/video files sent as Telegram documents."""
+    if not document:
+        return False
+
+    file_name = getattr(document, "file_name", "") or ""
+    mime_type = (getattr(document, "mime_type", "") or "").lower()
+    _, ext = os.path.splitext(file_name.lower())
+
+    if mime_type.startswith("audio/") or mime_type.startswith("video/"):
+        return True
+
+    return ext in SUPPORTED_DOCUMENT_EXTENSIONS
+
+
+def _is_video_document(document) -> bool:
+    """Return True if a Telegram document should be treated as video."""
+    if not document:
+        return False
+
+    file_name = getattr(document, "file_name", "") or ""
+    mime_type = (getattr(document, "mime_type", "") or "").lower()
+    _, ext = os.path.splitext(file_name.lower())
+
+    if mime_type.startswith("video/"):
+        return True
+
+    return ext in SUPPORTED_VIDEO_DOCUMENT_EXTENSIONS
+
+
+def _should_attach_srt(target_msg) -> bool:
+    """Attach subtitles only for video inputs."""
+    return bool(
+        target_msg.video
+        or target_msg.video_note
+        or _is_video_document(getattr(target_msg, "document", None))
+    )
+
+
+def _needs_ffmpeg_audio_extraction(target_msg) -> bool:
+    """Return True when the input is video and should be converted to audio first."""
+    return _should_attach_srt(target_msg)
+
+
+def _get_target_file_name(target_msg) -> str:
+    """Get the best filename candidate for a Telegram media message."""
+    if target_msg.voice:
+        return "voice.ogg"
+    if target_msg.audio:
+        return target_msg.audio.file_name or "audio.mp3"
+    if target_msg.video_note:
+        return "video_note.mp4"
+    if target_msg.video:
+        return target_msg.video.file_name or "video.mp4"
+    if target_msg.document and _is_supported_document(target_msg.document):
+        return target_msg.document.file_name or "document.bin"
+    return "media.bin"
+
+
+def _build_srt_name(target_msg) -> str:
+    """Build an SRT filename based on the source media name."""
+    source_name = _get_target_file_name(target_msg)
+    stem, _ = os.path.splitext(source_name)
+    stem = stem or "transcription"
+    return f"{stem}.srt"
+
+
+def _extract_audio_from_video(source_path: str) -> str:
+    """Extract mono 16 kHz PCM WAV audio from a video file using ffmpeg."""
+    output_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    output_path = output_file.name
+    output_file.close()
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        source_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        output_path,
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return output_path
+    except subprocess.CalledProcessError as exc:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        error_output = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"ffmpeg failed to extract audio from video: {error_output}") from exc
 
 
 def _is_message_for_bot(msg, bot_username: str, bot_id: int) -> bool:
@@ -49,6 +191,7 @@ def _resolve_target_message(msg):
         or msg.reply_to_message.audio
         or msg.reply_to_message.video_note
         or msg.reply_to_message.video
+        or _is_supported_document(msg.reply_to_message.document)
     ):
         return msg.reply_to_message
     return msg
@@ -63,6 +206,8 @@ async def _get_media_file(target_msg):
         return await target_msg.video_note.get_file()
     if target_msg.video:
         return await target_msg.video.get_file()
+    if _is_supported_document(target_msg.document):
+        return await target_msg.document.get_file()
     return None
 
 
@@ -96,6 +241,12 @@ async def _stop_status_task(status_task, transcription_done: asyncio.Event):
             await status_task
         except asyncio.CancelledError:
             pass
+
+
+def _set_engine_progress(engine, progress: ProgressState):
+    """Update shared engine progress if the engine exposes a mutable progress field."""
+    if hasattr(engine, "progress"):
+        engine.progress = progress
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,8 +289,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_parameters=ReplyParameters(message_id=msg.message_id),
     )
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    source_file_name = _get_target_file_name(target_msg)
+    source_suffix = _guess_suffix(
+        source_file_name,
+        getattr(target_msg.document, "mime_type", None)
+        if getattr(target_msg, "document", None)
+        else None,
+        default=".ogg",
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=source_suffix, delete=False)
     tmp.close()
+    prepared_path = tmp.name
+    srt_path = None
 
     transcription_done = asyncio.Event()
     started_at = time.time()
@@ -147,12 +308,25 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await tg_file.download_to_drive(tmp.name)
-        status_task = asyncio.create_task(
-            _update_status_periodically(status, engine, transcription_done, started_at)
-        )
+
+        if _needs_ffmpeg_audio_extraction(target_msg):
+            _set_engine_progress(engine, ProgressState(stage="extracting-audio"))
+            status_task = asyncio.create_task(
+                _update_status_periodically(status, engine, transcription_done, started_at)
+            )
+            await status.edit_text(build_status_message(engine.progress, int(time.time() - started_at), 0))
+
+        if _needs_ffmpeg_audio_extraction(target_msg):
+            loop = asyncio.get_running_loop()
+            prepared_path = await loop.run_in_executor(None, _extract_audio_from_video, tmp.name)
+
+        if not status_task:
+            status_task = asyncio.create_task(
+                _update_status_periodically(status, engine, transcription_done, started_at)
+            )
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, engine.transcribe, tmp.name)
+        result = await loop.run_in_executor(None, engine.transcribe, prepared_path)
         text = result["text"]
 
         await _stop_status_task(status_task, transcription_done)
@@ -177,6 +351,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await status.edit_text(reply)
 
+        segments = result.get("segments") or []
+        if _should_attach_srt(target_msg) and segments:
+            srt_content = build_srt(segments)
+            if srt_content.strip():
+                with tempfile.NamedTemporaryFile(suffix=".srt", delete=False, mode="w", encoding="utf-8") as srt_file:
+                    srt_file.write(srt_content)
+                    srt_path = srt_file.name
+
+                with open(srt_path, "rb") as srt_stream:
+                    await msg.reply_document(
+                        document=srt_stream,
+                        filename=_build_srt_name(target_msg),
+                        reply_parameters=ReplyParameters(message_id=msg.message_id),
+                    )
+
         log.info("Done: %s %.1fs: %s", result["engine"], result["elapsed"], text[:100])
     except Exception as exc:
         log.error("Transcription error: %s", exc, exc_info=True)
@@ -189,4 +378,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.unlink(tmp.name)
         except OSError:
             pass
+        if prepared_path != tmp.name:
+            try:
+                os.unlink(prepared_path)
+            except OSError:
+                pass
+        if srt_path:
+            try:
+                os.unlink(srt_path)
+            except OSError:
+                pass
 

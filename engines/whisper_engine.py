@@ -285,10 +285,19 @@ class _WorkerWhisperRuntime:
 
         self.log.info("Collecting transcription segments...")
         texts = []
+        segments = []
         segment_count = 0
 
         for seg in segs:
-            texts.append(seg.text.strip())
+            segment_text = seg.text.strip()
+            texts.append(segment_text)
+            segments.append(
+                {
+                    "start": float(getattr(seg, "start", 0.0) or 0.0),
+                    "end": float(getattr(seg, "end", 0.0) or 0.0),
+                    "text": segment_text,
+                }
+            )
             segment_count += 1
             current_position = (
                 min(float(getattr(seg, "end", 0.0) or 0.0), audio_duration)
@@ -328,6 +337,7 @@ class _WorkerWhisperRuntime:
         self.log.info("Transcription complete: %d segments processed", segment_count)
         return {
             "text": " ".join(texts),
+            "segments": segments,
             "duration": info.duration,
             "elapsed": time.time() - t0,
             "engine": engine_name,

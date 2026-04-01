@@ -60,6 +60,11 @@ class GeminiEngine:
             ".aac": "audio/aac",
             ".flac": "audio/flac",
             ".webm": "audio/webm",
+            ".mp4": "video/mp4",
+            ".mov": "video/quicktime",
+            ".mkv": "video/x-matroska",
+            ".avi": "video/x-msvideo",
+            ".m4v": "video/x-m4v",
         }
 
         self._set_progress(stage="waiting-response")
@@ -73,6 +78,7 @@ class GeminiEngine:
         self._set_progress(stage="finalizing", current=1, total=1)
         return {
             "text": resp.text.strip(),
+            "segments": [],
             "duration": 0,
             "elapsed": time.time() - t0,
             "engine": "gemini",

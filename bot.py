@@ -66,6 +66,7 @@ def main():
             | filters.AUDIO
             | filters.VIDEO_NOTE
             | filters.VIDEO
+            | filters.Document.ALL
             | (filters.TEXT & (~filters.COMMAND)),
             handle_voice,
         )
