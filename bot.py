@@ -7,6 +7,7 @@ either a local Whisper model or the Gemini API.
 All configuration is done via environment variables — see .env.example
 """
 
+import asyncio
 import logging
 import sys
 
@@ -16,8 +17,8 @@ from config import load_config
 from engines.gemini_engine import GeminiEngine
 from engines.whisper_engine import WhisperEngine
 from handlers.commands import cmd_start
-from handlers.transcription import handle_voice
-from services.idle_checker import post_init
+from handlers.transcription import handle_voice, _queue_processor
+from services.idle_checker import post_init, set_queue_processor
 
 
 logging.basicConfig(
@@ -42,6 +43,9 @@ def main():
     except ValueError as exc:
         log.error(str(exc))
         sys.exit(1)
+
+    # Register the queue processor to be started in post_init
+    set_queue_processor(_queue_processor)
 
     app = (
         Application.builder()
@@ -71,6 +75,7 @@ def main():
             handle_voice,
         )
     )
+
 
     log.info("Bot started (%s) with long polling (%ss timeout)", config.engine, config.telegram.polling_timeout)
     app.run_polling(

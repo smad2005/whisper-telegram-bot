@@ -241,8 +241,8 @@ class _WorkerWhisperRuntime:
         if self.config.model2_path and detected_lang == self.config.special_lang:
             self.log.info("Switching to special model for language: %s", detected_lang)
 
-            if info.duration > 60 and self.model:
-                self.log.info("Audio duration %.1fs > 60s, unloading first model to free memory", info.duration)
+            if info.duration > 20 and self.model:
+                self.log.info("Audio duration %.1fs > 20s, unloading first model to free memory", info.duration)
                 segs = None
                 self._release_model("model", "long special-language audio before loading model2")
                 model = None

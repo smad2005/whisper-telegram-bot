@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 
 from services.progress import ProgressState, build_status_message
 from services.subtitles import build_srt
+from services.queue_manager import transcription_queue
 
 
 log = logging.getLogger("bot")
@@ -285,63 +286,27 @@ def _set_engine_progress(engine, progress: ProgressState):
         engine.progress = progress
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming voice messages, audio files, and video notes."""
+async def _process_transcription_task(update: Update, context: ContextTypes.DEFAULT_TYPE, status):
+    """Process a single transcription task (internal function called from queue processor)."""
     user = update.effective_user
     msg = update.message
     if not user or not msg:
         return
 
-    allowed_users = context.application.bot_data.get("allowed_users", [])
-    if allowed_users and user.id not in allowed_users:
-        await msg.reply_text("Access denied.")
-        return
-
-    if msg.chat.type in ["group", "supergroup"]:
-        bot_username = context.bot.username
-        if not bot_username:
-            log.warning("Bot username not available in context, fetching...")
-            bot_me = await context.bot.get_me()
-            bot_username = bot_me.username
-
-        if not _is_message_for_bot(msg, bot_username or "", context.bot.id):
-            log.info("Ignored message in %s: no mention of @%s found", msg.chat.type, bot_username)
-            return
-
     target_msg = _resolve_target_message(msg)
-    target_size = _get_target_media_size(target_msg)
-    if target_size and target_size > BOT_API_DOWNLOAD_LIMIT_BYTES:
-        await msg.reply_text(
-            _build_file_too_big_message(target_size),
-            reply_parameters=ReplyParameters(message_id=msg.message_id),
-        )
-        return
-
-    try:
-        tg_file = await _get_media_file(target_msg)
-    except BadRequest as exc:
-        if "File is too big" in str(exc):
-            await msg.reply_text(
-                _build_file_too_big_message(target_size),
-                reply_parameters=ReplyParameters(message_id=msg.message_id),
-            )
-            return
-        raise
-
+    
+    # Media file was already validated in handle_voice before adding to queue
+    # Just get it again for processing
+    tg_file = await _get_media_file(target_msg)
     if not tg_file:
-        if msg.chat.type in ["group", "supergroup"]:
-            await msg.reply_text(
-                "I was mentioned, but I can't see the voice message. 🧐\n\n"
-                "To fix this, please **make me an Administrator** or disable **Privacy Mode** in @BotFather."
-            )
+        # This shouldn't happen since we validated before queuing, but handle it gracefully
+        await status.edit_text("Error: Media file no longer accessible")
         return
 
     engine = context.application.bot_data["stt_engine"]
-    log.info("Voice from %s (%d)", user.first_name, user.id)
-    status = await msg.reply_text(
-        "Transcribing...",
-        reply_parameters=ReplyParameters(message_id=msg.message_id),
-    )
+    log.info("Processing voice from %s (%d)", user.first_name, user.id)
+    
+    await status.edit_text("🔄 Processing...")
 
     source_file_name = _get_target_file_name(target_msg)
     source_suffix = _guess_suffix(
@@ -442,4 +407,105 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.unlink(srt_path)
             except OSError:
                 pass
+
+
+async def _queue_processor():
+    """Background task that processes transcription queue sequentially."""
+    while True:
+        try:
+            task = await transcription_queue.get_next_task()
+            if task:
+                log.info("Processing task from queue (position was %d)", task.position)
+                try:
+                    await _process_transcription_task(task.update, task.context, task.status_message)
+                except Exception as exc:
+                    log.error("Error processing queued task: %s", exc, exc_info=True)
+                    if task.status_message:
+                        try:
+                            await task.status_message.edit_text(f"Error: {exc}")
+                        except Exception:
+                            pass
+                finally:
+                    await transcription_queue.mark_task_complete()
+                    # Update status messages for remaining items in queue
+                    await transcription_queue.update_queue_status_messages()
+            else:
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            log.error("Queue processor error: %s", exc, exc_info=True)
+            await asyncio.sleep(1)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming voice messages, audio files, and video notes."""
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg:
+        return
+
+    allowed_users = context.application.bot_data.get("allowed_users", [])
+    if allowed_users and user.id not in allowed_users:
+        await msg.reply_text("Access denied.")
+        return
+
+    if msg.chat.type in ["group", "supergroup"]:
+        bot_username = context.bot.username
+        if not bot_username:
+            log.warning("Bot username not available in context, fetching...")
+            bot_me = await context.bot.get_me()
+            bot_username = bot_me.username
+
+        if not _is_message_for_bot(msg, bot_username or "", context.bot.id):
+            log.info("Ignored message in %s: no mention of @%s found", msg.chat.type, bot_username)
+            return
+
+    target_msg = _resolve_target_message(msg)
+    target_size = _get_target_media_size(target_msg)
+    if target_size and target_size > BOT_API_DOWNLOAD_LIMIT_BYTES:
+        await msg.reply_text(
+            _build_file_too_big_message(target_size),
+            reply_parameters=ReplyParameters(message_id=msg.message_id),
+        )
+        return
+
+    # Check if there's actually a media file to process BEFORE adding to queue
+    try:
+        tg_file = await _get_media_file(target_msg)
+    except BadRequest as exc:
+        if "File is too big" in str(exc):
+            await msg.reply_text(
+                _build_file_too_big_message(target_size),
+                reply_parameters=ReplyParameters(message_id=msg.message_id),
+            )
+            return
+        raise
+
+    if not tg_file:
+        # No valid media file found - don't add to queue
+        if msg.chat.type in ["group", "supergroup"]:
+            await msg.reply_text(
+                "I was mentioned, but I can't see the voice message. 🧐\n\n"
+                "To fix this, please **make me an Administrator** or disable **Privacy Mode** in @BotFather."
+            )
+        return
+
+    log.info("Voice message from %s (%d)", user.first_name, user.id)
+    
+    # Add to queue only if we have a valid media file
+    queue_position = transcription_queue.get_queue_size()
+    
+    if queue_position == 0 and not transcription_queue.is_processing():
+        status = await msg.reply_text(
+            "🔄 Processing...",
+            reply_parameters=ReplyParameters(message_id=msg.message_id),
+        )
+    else:
+        status = await msg.reply_text(
+            f"⏳ Queued for processing\nPosition: {queue_position + 1}",
+            reply_parameters=ReplyParameters(message_id=msg.message_id),
+        )
+    
+    await transcription_queue.add_task(update, context, status)
+    await transcription_queue.update_queue_status_messages()
+
 
