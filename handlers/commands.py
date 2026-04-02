@@ -9,7 +9,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 	engine = context.application.bot_data["config"].engine
 	await update.message.reply_text(
-		f"Send me a voice message and I will transcribe it.\n"
+		f"Send me a voice message and I will transcribe it.\n" 
+		f"In groups, add me as an Administrator for reliable replies.\n"
 		f"Engine: {engine}"
 	)
 

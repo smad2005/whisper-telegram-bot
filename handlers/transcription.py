@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import time
 
-from telegram import ReplyParameters, Update
+from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -234,6 +234,25 @@ def _resolve_target_message(msg):
     return msg
 
 
+def _reply_target_kwargs(target_msg) -> dict:
+    """Build send_message/send_document kwargs that force a reply to target_msg."""
+    kwargs = {
+        "chat_id": target_msg.chat_id,
+        "reply_to_message_id": target_msg.message_id,
+        "allow_sending_without_reply": True,
+    }
+    message_thread_id = getattr(target_msg, "message_thread_id", None)
+    if message_thread_id is not None:
+        kwargs["message_thread_id"] = message_thread_id
+    business_connection_id = getattr(target_msg, "business_connection_id", None)
+    if business_connection_id is not None:
+        kwargs["business_connection_id"] = business_connection_id
+    direct_messages_topic_id = getattr(target_msg, "direct_messages_topic", None)
+    if direct_messages_topic_id is not None:
+        kwargs["direct_messages_topic_id"] = direct_messages_topic_id.topic_id
+    return kwargs
+
+
 async def _get_media_file(target_msg):
     if target_msg.voice:
         return await target_msg.voice.get_file()
@@ -294,6 +313,7 @@ async def _process_transcription_task(update: Update, context: ContextTypes.DEFA
         return
 
     target_msg = _resolve_target_message(msg)
+    reply_target_kwargs = _reply_target_kwargs(target_msg)
     
     # Media file was already validated in handle_voice before adding to queue
     # Just get it again for processing
@@ -363,9 +383,9 @@ async def _process_transcription_task(update: Update, context: ContextTypes.DEFA
         if len(reply) > 4096:
             await status.edit_text(reply[:4096])
             for i in range(4096, len(reply), 4096):
-                await msg.reply_text(
-                    reply[i:i + 4096],
-                    reply_parameters=ReplyParameters(message_id=msg.message_id),
+                await context.bot.send_message(
+                    text=reply[i:i + 4096],
+                    **reply_target_kwargs,
                 )
         else:
             await status.edit_text(reply)
@@ -379,10 +399,10 @@ async def _process_transcription_task(update: Update, context: ContextTypes.DEFA
                     srt_path = srt_file.name
 
                 with open(srt_path, "rb") as srt_stream:
-                    await msg.reply_document(
+                    await context.bot.send_document(
                         document=srt_stream,
                         filename=_build_srt_name(target_msg),
-                        reply_parameters=ReplyParameters(message_id=msg.message_id),
+                        **reply_target_kwargs,
                     )
 
         log.info("Done: %s %.1fs: %s", result["engine"], result["elapsed"], text[:100])
@@ -443,9 +463,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not msg:
         return
 
+    target_msg = _resolve_target_message(msg)
+    reply_target_kwargs = _reply_target_kwargs(target_msg)
+
     allowed_users = context.application.bot_data.get("allowed_users", [])
     if allowed_users and user.id not in allowed_users:
-        await msg.reply_text("Access denied.")
+        await context.bot.send_message(text="Access denied.", **reply_target_kwargs)
         return
 
     if msg.chat.type in ["group", "supergroup"]:
@@ -459,13 +482,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info("Ignored message in %s: no mention of @%s found", msg.chat.type, bot_username)
             return
 
-    target_msg = _resolve_target_message(msg)
     target_size = _get_target_media_size(target_msg)
     if target_size and target_size > BOT_API_DOWNLOAD_LIMIT_BYTES:
-        await msg.reply_text(
-            _build_file_too_big_message(target_size),
-            reply_parameters=ReplyParameters(message_id=msg.message_id),
-        )
+        await context.bot.send_message(text=_build_file_too_big_message(target_size), **reply_target_kwargs)
         return
 
     # Check if there's actually a media file to process BEFORE adding to queue
@@ -473,19 +492,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await _get_media_file(target_msg)
     except BadRequest as exc:
         if "File is too big" in str(exc):
-            await msg.reply_text(
-                _build_file_too_big_message(target_size),
-                reply_parameters=ReplyParameters(message_id=msg.message_id),
-            )
+            await context.bot.send_message(text=_build_file_too_big_message(target_size), **reply_target_kwargs)
             return
         raise
 
     if not tg_file:
         # No valid media file found - don't add to queue
         if msg.chat.type in ["group", "supergroup"]:
-            await msg.reply_text(
-                "I was mentioned, but I can't see the voice message. 🧐\n\n"
-                "To fix this, please **make me an Administrator** or disable **Privacy Mode** in @BotFather."
+            await context.bot.send_message(
+                text=(
+                    "I was mentioned, but I can't see the voice message. 🧐\n\n"
+                    "For reliable work in groups, please **make me an Administrator**."
+                ),
+                **reply_target_kwargs,
             )
         return
 
@@ -495,14 +514,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_position = transcription_queue.get_queue_size()
     
     if queue_position == 0 and not transcription_queue.is_processing():
-        status = await msg.reply_text(
-            "🔄 Processing...",
-            reply_parameters=ReplyParameters(message_id=msg.message_id),
-        )
+        status = await context.bot.send_message(text="🔄 Processing...", **reply_target_kwargs)
     else:
-        status = await msg.reply_text(
-            f"⏳ Queued for processing\nPosition: {queue_position + 1}",
-            reply_parameters=ReplyParameters(message_id=msg.message_id),
+        status = await context.bot.send_message(
+            text=f"⏳ Queued for processing\nPosition: {queue_position + 1}",
+            **reply_target_kwargs,
         )
     
     await transcription_queue.add_task(update, context, status)
