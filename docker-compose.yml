@@ -8,6 +8,33 @@ services:
     volumes:
       # Persist downloaded Whisper models between restarts
       - ./models:/root/.cache/huggingface
+    develop:
+      watch:
+        - action: sync+restart
+          path: .
+          target: /app
+          ignore:
+            - .git/
+            - .idea/
+            - .venv/
+            - .pytest_cache/
+            - __pycache__/
+            - "**/__pycache__/"
+            - "*.pyc"
+            - "*.pyo"
+            - "*.pyd"
+            - .env
+            - .env.*
+            - .dockerignore
+            - .gitignore
+            - docker-compose.yml
+            - Dockerfile
+            - LICENSE
+            - README.md
+            - models/
+            - requirements.txt
+        - action: rebuild
+          path: ./requirements.txt
     deploy:
       resources:
         reservations:

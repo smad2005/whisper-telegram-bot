@@ -165,10 +165,13 @@ Runs [faster-whisper](https://github.com/SYSTRAN/faster-whisper) locally. No dat
 ```bash
 docker compose up -d          # Start in background
 docker compose logs -f        # Follow live logs
+docker compose watch         # Auto-sync *.py changes and restart the bot
 docker compose restart        # Restart after .env changes
 docker compose down           # Stop the bot
 docker compose up -d --build  # Rebuild after code changes
 ```
+
+For development, `docker compose watch` syncs the project into the container and restarts the bot automatically while ignoring non-code files such as `models/`, `README.md`, and Docker metadata. Changes to `requirements.txt` trigger a rebuild.
 
 ---
 
