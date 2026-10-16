@@ -142,7 +142,7 @@ Only used with `STT_ENGINE=qwen`. The image must be built with `WITH_QWEN=1` (se
 | `QWEN_DTYPE` | `bfloat16` | `bfloat16`, `float16`, `float32` |
 | `QWEN_LANGUAGE` | `auto` | `auto` or a language name, e.g. `Japanese`, `English`, `Russian` |
 | `QWEN_MAX_NEW_TOKENS` | `512` | Max generated tokens per chunk |
-| `QWEN_CHUNK_SECONDS` | `30` | Long audio is split into chunks of up to this length, cut at quiet points |
+| `QWEN_CHUNK_SECONDS` | `30` | Max chunk length. Long audio is split at speech pauses (Silero VAD), chunks are also the unit for subtitles |
 | `QWEN_BATCH_SIZE` | `4` | Chunks per inference batch. Lower it if you run out of VRAM |
 | `QWEN_IDLE_TIMEOUT` | `600` | Seconds of inactivity before the model is unloaded |
 
@@ -198,6 +198,15 @@ WITH_QWEN=1
 ```bash
 docker compose up -d --build
 ```
+
+**Subtitles (SRT for videos).** Qwen3-ASR returns plain text without timestamps, so the bot derives timing from the audio:
+
+1. Silero VAD (bundled with `faster-whisper`) finds speech; the audio is cut at pauses, never mid-phrase, into chunks of up to `QWEN_CHUNK_SECONDS`.
+2. Speech boundaries are refined by RMS energy (adaptive noise floor): starts may move back up to 0.6 s, ends forward up to 1 s, never into the neighbouring phrase.
+3. The text of each chunk is split into subtitle lines (sentences, long ones at commas, max ~84 characters or ~42 for CJK).
+4. Lines share the chunk's speech time proportionally to their text length, and a line border close to a real pause (within 0.8 s) is snapped to that pause.
+
+Timing is therefore an approximation, not true word alignment: it is accurate at pauses and less so inside a long uninterrupted phrase. If VAD finds no speech, the audio is cut into fixed chunks at quiet points instead, so nothing is dropped. This applies only to the `qwen` engine; Whisper uses its own segment timestamps.
 
 If `STT_ENGINE=qwen` but the image was built without `WITH_QWEN=1`, the bot exits at startup and tells you to rebuild.
 
