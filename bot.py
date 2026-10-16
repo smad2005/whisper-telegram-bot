@@ -33,6 +33,10 @@ def build_engine(config):
     """Create the configured speech-to-text engine."""
     if config.engine == "gemini":
         return GeminiEngine(config.gemini)
+    if config.engine == "qwen":
+        from engines.qwen_engine import QwenEngine
+
+        return QwenEngine(config.qwen)
     return WhisperEngine(config.whisper)
 
 

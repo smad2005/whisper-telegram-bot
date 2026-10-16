@@ -12,8 +12,11 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ARG WITH_QWEN=0
+
+COPY requirements.txt requirements-qwen.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    if [ "$WITH_QWEN" = "1" ]; then pip install --no-cache-dir -r requirements-qwen.txt; fi
 
 # ---- runtime stage: CUDA runtime + python + ffmpeg only ----
 FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu24.04

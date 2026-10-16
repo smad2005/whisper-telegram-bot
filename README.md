@@ -88,7 +88,7 @@ Edit `.env` and set your credentials:
 
 ```env
 BOT_TOKEN=123456:ABC-DEF...    # from @BotFather
-STT_ENGINE=gemini               # or "whisper"
+STT_ENGINE=gemini               # or "whisper" or "qwen"
 GEMINI_API_KEY=AIza...          # from https://aistudio.google.com/apikey
 ```
 
@@ -110,7 +110,7 @@ All settings are defined in the `.env` file:
 |:---|:---|:---|
 | `BOT_TOKEN` | — | **Required.** Telegram bot token from [@BotFather](https://t.me/BotFather) |
 | `ALLOWED_USERS` | *(empty)* | Comma-separated Telegram user IDs. Empty = allow everyone |
-| `STT_ENGINE` | `whisper` | Speech-to-text engine: `gemini` or `whisper` |
+| `STT_ENGINE` | `whisper` | Speech-to-text engine: `gemini`, `whisper` or `qwen` |
 
 ### Gemini Settings
 
@@ -129,6 +129,22 @@ All settings are defined in the `.env` file:
 | `WHISPER_COMPUTE` | `int8` | Compute type: `int8`, `float16`, `float32` |
 | `WHISPER_LANGUAGE` | `auto` | Language code or `auto` for auto-detection |
 | `WHISPER_BEAM_SIZE` | `5` | Beam search size (higher = more accurate, slower) |
+
+### Qwen3-ASR Settings
+
+Only used with `STT_ENGINE=qwen`. The image must be built with `WITH_QWEN=1` (see [Qwen3-ASR](#qwen3-asr-local-gpu)).
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `WITH_QWEN` | `0` | **Build-time.** `1` installs `torch` + `qwen-asr` into the image (large). Rebuild after changing |
+| `QWEN_MODEL` | `Qwen/Qwen3-ASR-1.7B` | `Qwen/Qwen3-ASR-1.7B` or the lighter `Qwen/Qwen3-ASR-0.6B` |
+| `QWEN_DEVICE` | `cuda:0` | `cuda:0` or `cpu` |
+| `QWEN_DTYPE` | `bfloat16` | `bfloat16`, `float16`, `float32` |
+| `QWEN_LANGUAGE` | `auto` | `auto` or a language name, e.g. `Japanese`, `English`, `Russian` |
+| `QWEN_MAX_NEW_TOKENS` | `512` | Max generated tokens per chunk |
+| `QWEN_CHUNK_SECONDS` | `30` | Long audio is split into chunks of up to this length, cut at quiet points |
+| `QWEN_BATCH_SIZE` | `4` | Chunks per inference batch. Lower it if you run out of VRAM |
+| `QWEN_IDLE_TIMEOUT` | `600` | Seconds of inactivity before the model is unloaded |
 
 ---
 
@@ -158,6 +174,67 @@ Runs [faster-whisper](https://github.com/SYSTRAN/faster-whisper) locally. No dat
 | **Languages** | 99 languages |
 | **Setup** | Model downloads on first run (~1 GB) |
 
+### Qwen3-ASR (local, GPU)
+
+Runs [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) locally via `transformers`. Like Whisper, it runs in an isolated worker process that exits when idle, so RAM and VRAM are returned to the OS.
+
+| | |
+|:---|:---|
+| **Privacy** | ✅ Fully offline |
+| **Hardware** | NVIDIA GPU recommended. The 1.7B model is ~4.4 GB of weights in bf16, so on 6 GB cards lower `QWEN_BATCH_SIZE` or use `Qwen3-ASR-0.6B` |
+| **Languages** | 30 (see below) |
+| **Setup** | Build with `WITH_QWEN=1` (image grows to ~10 GB), model downloads on first request (~4.4 GB) |
+
+**Supported languages:** Chinese, English, Cantonese, Arabic, German, French, Spanish, Portuguese, Indonesian, Italian, Korean, Russian, Thai, Vietnamese, Japanese, Turkish, Hindi, Malay, Dutch, Swedish, Danish, Finnish, Polish, Czech, Filipino, Persian, Greek, Hungarian, Macedonian, Romanian.
+**Not supported:** Ukrainian, Hebrew (use `STT_ENGINE=whisper` for those). The `WHISPER_MODEL2` Hebrew model is not used in `qwen` mode. Full list: [model card](https://huggingface.co/Qwen/Qwen3-ASR-1.7B).
+
+**Enable it:**
+
+```env
+STT_ENGINE=qwen
+WITH_QWEN=1
+```
+
+```bash
+docker compose up -d --build
+```
+
+If `STT_ENGINE=qwen` but the image was built without `WITH_QWEN=1`, the bot exits at startup and tells you to rebuild.
+
+**Model cache.** Models are cached in the shared `hf-cache` Docker volume, see [Where Models Are Stored](#-where-models-are-stored). Loading Qwen from a Windows bind mount took ~218 s in our test vs ~5.5 s from the volume.
+
+---
+
+## 💾 Where Models Are Stored
+
+All downloaded models (Whisper and Qwen) are stored in one Docker volume, `hf-cache`, mounted at `/root/.cache/huggingface` (the standard Hugging Face cache, `hub/models--<org>--<name>`). Gemini is a cloud API and stores nothing.
+
+- **Name on the host:** `<project>_hf-cache`. `<project>` is the compose project name, by default the folder name, so `whisper-telegram-bot_hf-cache`.
+- **Location:** inside Docker's virtual disk (WSL2), **not** in the project folder, so it is not visible in Explorer.
+- **Why a volume and not `./models`:** `transformers` (Qwen) memory-maps the weights, which is very slow on a Windows bind mount.
+- Models are downloaded automatically on first use and survive `docker compose down` and rebuilds. Only `docker compose down -v` or `docker volume rm` deletes them.
+
+**Inspect and clean up:**
+
+```bash
+docker system df -v                       # volume size
+docker run --rm -v whisper-telegram-bot_hf-cache:/d alpine du -sh /d/hub/*     # what is inside
+docker run --rm -v whisper-telegram-bot_hf-cache:/d alpine rm -rf /d/hub/models--Systran--faster-whisper-large-v2   # delete one model
+docker compose down && docker volume rm whisper-telegram-bot_hf-cache          # delete all models
+```
+
+Deleting a Docker volume does not shrink `docker_data.vhdx` on Windows; compact the disk in Docker Desktop (Settings → Resources) to get the space back.
+
+**Migrating models from an older `./models` folder** (earlier versions bind-mounted it): copy them into the volume once, `./models` itself is not modified.
+
+```bash
+docker compose up -d --no-start
+docker run --rm -v "$(pwd)/models:/src:ro" -v whisper-telegram-bot_hf-cache:/dst --entrypoint sh whisper-telegram-bot-bot \
+  -c 'mkdir -p /dst/hub && cp -a /src/hub/models--* /dst/hub/'
+```
+
+After checking the bot works you can delete `./models`.
+
 ---
 
 ## 🐳 Docker Commands
@@ -171,7 +248,7 @@ docker compose down           # Stop the bot
 docker compose up -d --build  # Rebuild after code changes
 ```
 
-For development, `docker compose watch` syncs the project into the container and restarts the bot automatically while ignoring non-code files such as `models/`, `README.md`, and Docker metadata. Changes to `requirements.txt` trigger a rebuild.
+For development, `docker compose watch` syncs the project into the container and restarts the bot automatically while ignoring non-code files such as `models/`, `README.md`, and Docker metadata. Changes to `requirements.txt` or `requirements-qwen.txt` trigger a rebuild.
 
 ---
 
@@ -179,10 +256,12 @@ For development, `docker compose watch` syncs the project into the container and
 
 ```
 whisper-telegram-bot/
-├── bot.py               # Main bot logic with Whisper & Gemini engines
-├── Dockerfile           # Container image definition
+├── bot.py               # Bot entry point, picks the STT engine
+├── engines/             # whisper_engine.py, gemini_engine.py, qwen_engine.py
+├── Dockerfile           # Multi-stage container image definition
 ├── docker-compose.yml   # Service orchestration
 ├── requirements.txt     # Python dependencies
+├── requirements-qwen.txt # Optional Qwen3-ASR dependencies (WITH_QWEN=1)
 ├── .env.example         # Environment template
 ├── .dockerignore        # Docker build exclusions
 ├── .gitignore           # Git exclusions

@@ -31,11 +31,24 @@ class GeminiConfig:
 
 
 @dataclass(slots=True)
+class QwenConfig:
+    model_path: str
+    device: str
+    dtype: str
+    language: str | None
+    max_new_tokens: int
+    chunk_seconds: int
+    batch_size: int
+    idle_timeout: int
+
+
+@dataclass(slots=True)
 class BotConfig:
     telegram: TelegramConfig
     engine: str
     whisper: WhisperConfig
     gemini: GeminiConfig
+    qwen: QwenConfig
 
 
 def _parse_allowed_users(raw_value: str) -> list[int]:
@@ -55,11 +68,12 @@ def load_config() -> BotConfig:
         raise ValueError("BOT_TOKEN is not set! Check your .env file.")
 
     engine = os.getenv("STT_ENGINE", "whisper").strip().lower() or "whisper"
-    if engine not in {"whisper", "gemini"}:
-        raise ValueError("STT_ENGINE must be either 'whisper' or 'gemini'.")
+    if engine not in {"whisper", "gemini", "qwen"}:
+        raise ValueError("STT_ENGINE must be one of 'whisper', 'gemini' or 'qwen'.")
 
     whisper_language = os.getenv("WHISPER_LANGUAGE", "auto").strip()
     gemini_language = os.getenv("GEMINI_LANGUAGE", "auto").strip()
+    qwen_language = os.getenv("QWEN_LANGUAGE", "auto").strip()
 
     return BotConfig(
         telegram=TelegramConfig(
@@ -84,6 +98,16 @@ def load_config() -> BotConfig:
             api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             language="Detect language" if gemini_language == "auto" else gemini_language,
+        ),
+        qwen=QwenConfig(
+            model_path=os.getenv("QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B"),
+            device=os.getenv("QWEN_DEVICE", "cuda:0"),
+            dtype=os.getenv("QWEN_DTYPE", "bfloat16").strip().lower(),
+            language=None if qwen_language.lower() == "auto" else qwen_language,
+            max_new_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "512")),
+            chunk_seconds=int(os.getenv("QWEN_CHUNK_SECONDS", "30")),
+            batch_size=int(os.getenv("QWEN_BATCH_SIZE", "4")),
+            idle_timeout=int(os.getenv("QWEN_IDLE_TIMEOUT", "600")),
         ),
     )
 
