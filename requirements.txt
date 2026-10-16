@@ -1,3 +1,4 @@
-python-telegram-bot>=21.0
-google-genai>=1.0.0
-faster-whisper>=1.1.0
+python-telegram-bot==22.8
+google-genai==2.31.0
+faster-whisper==1.2.1
+av==18.1.0  # 19.x removed metadata_errors, which faster-whisper 1.2.1 still passes
